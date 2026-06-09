@@ -33,7 +33,10 @@ const storage = multer.diskStorage({
     cb(null, uniqueSuffix + '-' + file.originalname);
   }
 });
-const upload = multer({ storage });
+const upload = multer({ storage, limits: {
+    fileSize: 10 * 1024 * 1024 
+  } 
+});
 
 
 const uploadToCloudinary = async (filePath, folder, resourceType = 'raw') => {
@@ -417,6 +420,17 @@ app.get('/api/users/:id/saved-models', async (req, res) => {
     console.error("Error loading saved models:", err);
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File to large! Max Size — 10 MB.' });
+    }
+  } else if (err) {
+    return res.status(500).json({ error: err.message });
+  }
+  next();
 });
 
 app.listen(process.env.PORT || 5000, () => {
