@@ -6,37 +6,59 @@ const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs'); 
 const cron = require('node-cron');
+const cloudinary = require('cloudinary').v2; 
 require('dotenv').config();
 
 const app = express();
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-app.use('/icons', express.static(path.join(__dirname, 'icons')));
+
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+
+if (!fs.existsSync('uploads')) {
+  fs.mkdirSync('uploads');
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, 'uploads/'),
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + '-' + file.originalname);
+  }
+});
+const upload = multer({ storage });
+
+// ==========================================
+// 3. ХЕЛПЕР ДЛЯ ЗАВАНТАЖЕННЯ У ХМАРУ
+// ==========================================
+const uploadToCloudinary = async (filePath, folder, resourceType = 'raw') => {
+  try {
+    const result = await cloudinary.uploader.upload(filePath, {
+      folder: `3dhub/${folder}`,
+      resource_type: resourceType,
+      use_filename: true,
+      unique_filename: true
+    });
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath); 
+    return result.secure_url;
+  } catch (error) {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath); 
+    console.error(`Помилка Cloudinary у папці ${folder}:`, error);
+    throw new Error('Не вдалося завантажити файл у хмарне сховище');
+  }
+};
+
 
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Connected'))
   .catch(err => console.log(err));
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    if (file.fieldname === 'iconFile') {
-      cb(null, 'icons/');
-    } 
-    else if (file.fieldname === 'glbOrderFile' || file.fieldname === 'fbxOrderFile') {
-      cb(null, 'completed_orders/'); 
-    }
-    else {
-      cb(null, 'uploads/');
-    }
-  },
-  filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
-});
-const upload = multer({ storage });
-
-app.use('/completed_orders', express.static(path.join(__dirname, 'completed_orders')));
-
 
 const UserSchema = new mongoose.Schema({
   icon: {type: String},
@@ -69,13 +91,12 @@ const OrderSchema = new mongoose.Schema({
   glbFileUrl: { type: String, default: null },
   fbxFileUrl: { type: String, default: null }
 });
-
 const Order = mongoose.model('Order', OrderSchema);
+
 
 cron.schedule('*/5 * * * *', async () => {
   try {
     const now = new Date();
-
     const expiredOrders = await Order.find({
       status: 'in-progress',
       deadline: { $lt: now } 
@@ -83,7 +104,6 @@ cron.schedule('*/5 * * * *', async () => {
 
     if (expiredOrders.length > 0) {
       console.log(`Overdue orders found: ${expiredOrders.length}. Returning to the stock exchange...`);
-
       await Order.updateMany(
         { status: 'in-progress', deadline: { $lt: now } },
         { $set: { status: 'open', worker: null } }
@@ -94,18 +114,16 @@ cron.schedule('*/5 * * * *', async () => {
   }
 });
 
+
+
 app.post('/api/orders', async (req, res) => {
   try {
     const { title, description, customerId, daysToComplete } = req.body;
-    
     const deadlineDate = new Date();
     deadlineDate.setDate(deadlineDate.getDate() + Number(daysToComplete));
 
     const newOrder = new Order({
-      title,
-      description,
-      customer: customerId,
-      deadline: deadlineDate
+      title, description, customer: customerId, deadline: deadlineDate
     });
 
     await newOrder.save();
@@ -148,18 +166,14 @@ app.put('/api/orders/:id/complete', upload.fields([
 ]), async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
-
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    
-    if (order.status !== 'in-progress') {
-      return res.status(400).json({ error: 'This order is not in progress or the time has expired!' });
-    }
+    if (order.status !== 'in-progress') return res.status(400).json({ error: 'This order is not in progress or the time has expired!' });
 
     if (req.files['glbOrderFile']) {
-      order.glbFileUrl = `/completed_orders/${req.files['glbOrderFile'][0].filename}`;
+      order.glbFileUrl = await uploadToCloudinary(req.files['glbOrderFile'][0].path, 'orders', 'raw');
     }
     if (req.files['fbxOrderFile']) {
-      order.fbxFileUrl = `/completed_orders/${req.files['fbxOrderFile'][0].filename}`;
+      order.fbxFileUrl = await uploadToCloudinary(req.files['fbxOrderFile'][0].path, 'orders', 'raw');
     }
 
     if (!order.glbFileUrl && !order.fbxFileUrl) {
@@ -168,7 +182,6 @@ app.put('/api/orders/:id/complete', upload.fields([
 
     order.status = 'completed';
     await order.save();
-
     res.json({ message: 'The work has been successfully submitted!', order });
   } catch (err) {
     console.error("Order submission error:", err);
@@ -179,11 +192,9 @@ app.put('/api/orders/:id/complete', upload.fields([
 app.get('/api/users/:id/my-orders', async (req, res) => {
   try {
     const userId = req.params.id;
-
     const orders = await Order.find({
       $or: [{ customer: userId }, { worker: userId }]
     }).populate('customer worker', 'name email icon');
-
     res.json(orders);
   } catch (err) {
     res.status(500).json({ error: 'Error loading user orders' });
@@ -200,17 +211,16 @@ app.post('/api/register', upload.single('iconFile'), async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    const iconPath = req.file ? `/icons/${req.file.filename}` : null;
+    let cloudIconUrl = null;
+    if (req.file) {
+      cloudIconUrl = await uploadToCloudinary(req.file.path, 'icons', 'image');
+    }
 
     const newUser = new User({ 
-      name, 
-      email, 
-      icon: iconPath, 
-      password: hashedPassword 
+      name, email, icon: cloudIconUrl, password: hashedPassword 
     });
     
     await newUser.save();
-
     res.json({ userId: newUser._id, name: newUser.name, email: newUser.email, icon: newUser.icon });
   } catch (err) {
     console.error("Registration error:", err);
@@ -221,7 +231,6 @@ app.post('/api/register', upload.single('iconFile'), async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ error: "User does not exist!" });
 
@@ -234,13 +243,11 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-
 app.get('/api/models', async (req, res) => {
   const { search, userId } = req.query;
   const query = {};
   if (search) query.title = { $regex: search, $options: 'i' };
   if (userId) query.userId = userId;
-  
   const models = await Model3D.find(query);
   res.json(models);
 });
@@ -250,19 +257,14 @@ app.get('/api/users', async (req, res) => {
   const query = {};
   if (search) query.name = { $regex: search, $options: 'i' };
   if (userId) query.userId = userId;
-  
   const users = await User.find(query);
   res.json(users);
 });
 
 app.get('/api/users/:id', async (req, res) => {
-
   try {
     const user = await User.findById(req.params.id);
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    if (!user) return res.status(404).json({ error: 'User not found' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -271,11 +273,7 @@ app.get('/api/users/:id', async (req, res) => {
 app.get('/api/user/:id', async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select('-password'); 
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
+    if (!user) return res.status(404).json({ error: 'User not found' });
     res.json(user);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -283,35 +281,35 @@ app.get('/api/user/:id', async (req, res) => {
 });
 
 app.get('/api/models/:id', async (req, res) => {
-
   try {
     const model = await Model3D.findById(req.params.id);
+    if (!model) return res.status(404).json({ error: 'Model not found' });
     
-    if (!model) {
-      return res.status(404).json({ error: 'Model not found' });
-    }
     const user = await User.findById(model.userId);
-    
     const modelWithAuthor = {
       ...model.toObject(), 
       authorName: user ? user.name : 'Anonymous user' 
     };
-
     res.json(modelWithAuthor);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-
 app.post('/api/models', upload.single('modelFile'), async (req, res) => {
   try {
+    let cloudUrl = null;
+    if (req.file) {
+      cloudUrl = await uploadToCloudinary(req.file.path, 'gallery', 'raw');
+    }
+
     const newModel = new Model3D({
       title: req.body.title,
       description: req.body.description,
-      fileUrl: `/uploads/${req.file.filename}`,
+      fileUrl: cloudUrl,
       userId: req.body.userId 
     });
+    
     await newModel.save();
     res.json(newModel);
   } catch (err) {
@@ -319,84 +317,42 @@ app.post('/api/models', upload.single('modelFile'), async (req, res) => {
   }
 });
 
-
 app.delete('/api/models/:id', async(req, res) => {
   try {
-    
     const model = await Model3D.findByIdAndDelete(req.params.id);
-
-    if (!model) {
-      return res.status(404).json({ error: 'This model does not exist' });
-    }
-
-    if (model.fileUrl) {
-      const fileName = path.basename(model.fileUrl);
-      const filePath = path.join(process.cwd(), 'uploads', fileName);
-      
-      fs.unlink(filePath, (err) => {
-        if (err) {
-          console.error('File not found on disk:', err.message);
-        } else {
-          console.log('The file has been successfully deleted from the folder!');
-        }
-      });
-    }
-
-    res.json({ message: 'Model and file successfully deleted' });
-
+    if (!model) return res.status(404).json({ error: 'This model does not exist' });
+        
+    res.json({ message: 'Model successfully deleted from database' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Server problem' });
   }
 });
 
-
 app.put('/api/models/:id', upload.single('modelFile'), async (req, res) => {
   try {
     const model = await Model3D.findById(req.params.id);
-    
-    if (!model) {
-      return res.status(404).json({ error: 'Model not found' });
-    }
+    if (!model) return res.status(404).json({ error: 'Model not found' });
 
     model.title = req.body.title || model.title;
     model.description = req.body.description || model.description;
 
     if (req.file) {
-      if (model.fileUrl) {
-        const oldFileName = path.basename(model.fileUrl);
-        const oldFilePath = path.join(process.cwd(), 'uploads', oldFileName);
-        
-        fs.unlink(oldFilePath, (err) => {
-          if (err) {
-            console.error("The old file was not found, but we are continuing the update.");
-          } else {
-            console.log("The old file has been successfully replaced!");
-          }
-        });
-      }
-
-      model.fileUrl = `/uploads/${req.file.filename}`;
+      model.fileUrl = await uploadToCloudinary(req.file.path, 'gallery', 'raw');
     }
 
     await model.save();
-
     res.json({ message: 'The model has been successfully updated!', model });
-
   } catch (err) {
     console.error("Server error during update:", err);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-
 app.put('/api/users/:id', upload.single('iconFile'), async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
     user.name = req.body.name || user.name;
 
@@ -406,20 +362,7 @@ app.put('/api/users/:id', upload.single('iconFile'), async (req, res) => {
     }
 
     if (req.file) {
-      if (user.icon) {
-        const oldFileName = path.basename(user.icon);
-        const oldFilePath = path.join(process.cwd(), 'icons', oldFileName);
-        
-        fs.unlink(oldFilePath, (err) => {
-          if (err) {
-            console.error(" The old file was not found, but we are continuing the update.");
-          } else {
-            console.log(" The old file has been successfully deleted!");
-          }
-        });
-      }
-
-      user.icon = `/icons/${req.file.filename}`;
+      user.icon = await uploadToCloudinary(req.file.path, 'icons', 'image');
     }
 
     await user.save();
@@ -434,11 +377,9 @@ app.put('/api/users/:id', upload.single('iconFile'), async (req, res) => {
     res.json({ message: 'User successfully updated!', user: updatedUser });
 
   } catch (err) {
-      console.error("Error details:", err.response?.data || err.message);
-      
-      const errorMsg = err.response?.data?.error || 'Update error! See console F12.';
-      alert(errorMsg);
-    }
+    console.error("Update user error:", err);
+    res.status(500).json({ error: 'Update error! See console F12.' });
+  }
 });
 
 app.post('/api/users/:id/save-model', async (req, res) => {
@@ -457,7 +398,6 @@ app.post('/api/users/:id/save-model', async (req, res) => {
     }
 
     await user.save();
-    
     res.json({ savedModels: user.savedModels });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -474,7 +414,6 @@ app.get('/api/users/:id/saved-models', async (req, res) => {
     }
 
     const savedModels = await Model3D.find({ _id: { $in: user.savedModels } });
-    
     res.json(savedModels);
   } catch (err) {
     console.error("Error loading saved models:", err);
