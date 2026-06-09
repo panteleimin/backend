@@ -35,9 +35,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// ==========================================
-// 3. ХЕЛПЕР ДЛЯ ЗАВАНТАЖЕННЯ У ХМАРУ
-// ==========================================
+
 const uploadToCloudinary = async (filePath, folder, resourceType = 'raw') => {
   try {
     const result = await cloudinary.uploader.upload(filePath, {
